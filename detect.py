@@ -1,5 +1,7 @@
+import sys
 import argparse
 import time
+import math
 from pathlib import Path
 
 import cv2
@@ -9,10 +11,156 @@ from numpy import random
 
 from models.experimental import attempt_load
 from utils.datasets import LoadStreams, LoadImages
+from utils.stdin_reader import LoadStdin
 from utils.general import check_img_size, check_requirements, check_imshow, non_max_suppression, apply_classifier, \
     scale_coords, xyxy2xywh, strip_optimizer, set_logging, increment_path
 from utils.plots import plot_one_box
 from utils.torch_utils import select_device, load_classifier, time_synchronized
+import pymongo
+from datetime import datetime,timezone
+import queue
+from threading import Thread
+import uuid
+from elasticsearch import Elasticsearch
+import requests
+import json
+
+
+http_server = "http://127.0.0.1:5000"
+
+#mongo_client = pymongo.MongoClient("mongodb://" + "127.0.0.1" + ":27017/")
+#db = mongo_client["yolov5"]
+
+database_queue = queue.Queue()
+
+def save(table,data):
+    database_queue.put([table,data])
+
+def database_writer():
+    print("database writer starting")
+    while True:
+        table,data = database_queue.get()
+        headers = {'Content-type': 'application/octet-stream'}
+        try:
+            if data is None:
+                break
+
+            if 'frame' in data:
+                #print("Encoding image")
+                encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 90]
+                frame = cv2.imencode('.jpg', data['frame'], encode_param)[1].tobytes()
+                requests.post(http_server + "/set/frame", data = frame, headers = headers)
+                requests.post(http_server + "/set/" + data['uuid'], data = frame, headers = headers)
+                del data['frame']
+
+            #print("Posting to database " + table)
+            requests.post(http_server + "/message/" + table, data = json.dumps(data), headers=headers)
+        except:
+            print("Caught exception",sys.exc_info()[0])
+
+    print("Done with database writer")
+
+databasethread = Thread(target=database_writer, daemon=True)
+print("Starting database thread")
+databasethread.start()
+
+class DistMetric:
+    def __init__(self,xy,kind):
+        self.xy = xy
+        self.kind = kind
+
+    def SameKind(self,other):
+        return self.kind == other.kind
+    
+    def closeTo(self,other):
+        if not self.SameKind(other):
+            return False
+        dx = self.xy[0] - other.xy[0]
+        dy = self.xy[1] - other.xy[1]
+        dist = 640 * math.sqrt(dx*dx+dy*dy)
+        return dist < 10 # 10 pixel closeness
+
+class StaticObj:
+    def __init__(self,metric,data,t):
+        self.data = data;
+        self.last_seen = t
+        self.first_seen = t
+        self.static = False
+        self.metric = metric
+        self.last_write = None
+    
+    def needsWriting(self,t):
+        if self.last_write is None or t > self.last_write + 10:
+            self.last_write = t
+            return True
+        else:
+            return False
+    
+    def isStatic(self):
+        return self.static
+    
+    def age(self,t):
+        return t - self.first_seen
+    
+    def tooOld(self,t):
+        return (t - self.last_seen) > 5
+    
+    def oldEnough(self,t):
+        return self.age(t) > 5
+    
+    def closeToMetric(self,metric):
+        return metric.closeTo(self.metric)
+    
+    def Refresh(self,t):
+        self.last_seen = t
+    
+    def Promote(self,t):
+        if not self.isStatic() and self.oldEnough(t):
+            self.static = True
+            return True
+        else:
+            return False
+    
+
+class StaticCache:
+    def __init__(self):
+        self.static_objects = []
+        self.close_dist = 10
+        self.static_time = 5
+    
+    def stats(self):
+        total = len(self.static_objects)
+        static = len(list(filter(lambda v: v.isStatic(), self.static_objects)))
+        return "Total count: " + str(total) + ", static: " + str(static)
+    
+    def Add(self,metric,data,t):
+        for obj in self.static_objects:
+            if obj.closeToMetric(metric):
+                obj.Refresh(t)
+                return obj
+        # add it
+        obj = StaticObj(metric,data,t)
+
+        self.static_objects.append(obj)
+        return obj
+
+    def Promote(self,t):
+        promoted = []
+        for obj in self.static_objects:
+            if obj.Promote(t):
+                promoted.append(obj)
+        
+        toremove = []
+        for obj in self.static_objects:
+            if obj.tooOld(t):
+                toremove.append(obj)
+        
+        for obj in toremove:
+            self.static_objects.remove(obj)
+            
+        return promoted
+          
+static_objects = StaticCache()
 
 
 def detect(save_img=False):
@@ -48,6 +196,10 @@ def detect(save_img=False):
         view_img = check_imshow()
         cudnn.benchmark = True  # set True to speed up constant image size inference
         dataset = LoadStreams(source, img_size=imgsz, stride=stride)
+    elif source == "stdin":
+        view_img = check_imshow()
+        cudnn.benchmark = True
+        dataset = LoadStdin(img_size=imgsz, stride=stride)
     else:
         save_img = True
         dataset = LoadImages(source, img_size=imgsz, stride=stride)
@@ -66,6 +218,9 @@ def detect(save_img=False):
         img /= 255.0  # 0 - 255 to 0.0 - 1.0
         if img.ndimension() == 3:
             img = img.unsqueeze(0)
+
+        starttime = time.time()
+        thistime = datetime.now(timezone.utc).isoformat()
 
         # Inference
         t1 = time_synchronized()
@@ -100,17 +255,57 @@ def detect(save_img=False):
                     n = (det[:, -1] == c).sum()  # detections per class
                     s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
+                had_detection = False
+                frame_id = str(uuid.uuid4())
+
                 # Write results
+                #interesting_labels = ['truck','car','person','dog','bicycle','motorbike','cat','backpack','handbag']
+                original_image = im0.copy()
+
+                detections = []
+
                 for *xyxy, conf, cls in reversed(det):
                     if save_txt:  # Write to file
                         xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
                         line = (cls, *xywh, conf) if opt.save_conf else (cls, *xywh)  # label format
                         with open(txt_path + '.txt', 'a') as f:
                             f.write(('%g ' * len(line)).rstrip() % line + '\n')
+                    xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
+
+                    label = f'{names[int(cls)]} {conf:.2f}'
+                    line = (cls, label, *xywh)  # label format
+                    
+                    labelname = f'{names[int(cls)]}'
+                    
+                    # area = (640*xywh[2]) * (640*xywh[3])
+                    # if area < 20*20:
+                    #     continue
+                    
+                    detections.append( {
+                        'label': labelname,
+                        'conf': conf.item(),
+                        'xywh': xywh,
+                    })
 
                     if save_img or view_img:  # Add bbox to image
                         label = f'{names[int(cls)]} {conf:.2f}'
                         plot_one_box(xyxy, im0, label=label, color=colors[int(cls)], line_thickness=3)
+                    
+
+                    print(line)
+
+                #static_objects.Promote(starttime)
+                #print("Static object stats: " + static_objects.stats())
+
+                if len(detections) > 0:
+                    save('yolov5',{
+                        'proc_time':t2 - t1,
+                        'uuid':frame_id,
+                        'time': thistime,
+                        'detections': detections,
+                        'frame':original_image
+                    })
+
 
             # Print time (inference + NMS)
             print(f'{s}Done. ({t2 - t1:.3f}s)')
